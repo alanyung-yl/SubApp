@@ -8,13 +8,15 @@ My intended behavior for pressing "CANCEL" or "close window(X)" is to close the 
 when job complete -  either do nothing or exit app
 """
 try:
-    from PyQt5.QtWidgets import (
-        QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QFileDialog, QTextEdit, QFrame, QSizePolicy, QTableWidget, QTableWidgetItem, QLineEdit, QHBoxLayout, QComboBox, QInputDialog, QMenuBar, QMenu, QAction, QDialog, QCheckBox, QDialogButtonBox, QFormLayout
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QVBoxLayout, QLabel, QPushButton, QFileDialog, QTextEdit, QFrame, QSizePolicy, 
+        QTableWidget, QTableWidgetItem, QLineEdit, QHBoxLayout, QComboBox, QInputDialog, QMenuBar, QMenu, 
+        QDialog, QCheckBox, QDialogButtonBox, QFormLayout, QStyleFactory, QHeaderView
     )
-    from PyQt5.QtCore import Qt, QMetaObject, pyqtSignal, Q_ARG
-    from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QColor
+    from PyQt6.QtCore import Qt, QMetaObject, pyqtSignal, Q_ARG, QTimer, pyqtSlot
+    from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QColor, QIcon, QAction, QPalette
 except ImportError:
-    print("PyQt5 is required. Please install it with 'pip install PyQt5'.")
+    print("PyQt6 is required. Please install it with 'pip install PyQt6'.")
     import sys
     sys.exit(1)
 import sys
@@ -23,11 +25,8 @@ import threading
 import SubRename as sr
 import json
 import subprocess
-from PyQt5.QtCore import QTimer
-from PyQt5.QtCore import pyqtSlot
 import shutil
 import logging
-from PyQt5.QtGui import QIcon
 
 SETTINGS_FILE = "settings.json"
 SUBTITLE_FILE_FILTER = "Subtitle Files (*.ass *.srt *.ssa);;All Files (*)"
@@ -75,17 +74,9 @@ def set_compact_mode(enabled):
     save_settings(settings)
 
 # ─── Theme Styles ──────────────────────────────────────────────────────────────
+# Simplified theme system - Qt6 handles most styling automatically
 LIGHT_THEME = {
-    'window_bg': '#f0f0f0',
-    'widget_bg': '#ffffff',
-    'text_color': '#000000',
-    'border_color': '#888888',
-    'button_bg': '#e0e0e0',
-    'button_hover': '#d0d0d0',
-    'table_header_bg': '#f8f8f8',
-    'table_alternate_bg': '#f5f5f5',
     'drop_area_bg': '#fafafa',
-    'log_bg': '#ffffff',
     'success_color': '#28a745',
     'error_color': '#dc3545',
     'warning_color': '#ffc107',
@@ -93,16 +84,7 @@ LIGHT_THEME = {
 }
 
 DARK_THEME = {
-    'window_bg': '#0f0f0f',
-    'widget_bg': '#1a1a1a',
-    'text_color': '#e0e0e0',
-    'border_color': '#2a2a2a',
-    'button_bg': '#2a2a2a',
-    'button_hover': '#3a3a3a',
-    'table_header_bg': '#252525',
-    'table_alternate_bg': '#151515',
     'drop_area_bg': '#1a1a1a',
-    'log_bg': '#1a1a1a',
     'success_color': '#4ec9b0',
     'error_color': '#f44747',
     'warning_color': '#ce9178',
@@ -145,64 +127,26 @@ class DropArea(QFrame):
     def update_theme(self, theme):
         """Update the drop area styling based on the current theme"""
         self.current_theme = theme
+        # Minimal styling - let Qt6 handle most of it
         self.setStyleSheet(f'''
             QFrame {{
-                border: 2px solid {theme['border_color']};
+                border: 2px dashed palette(mid);
                 border-radius: 10px;
                 background: {theme['drop_area_bg']};
             }}
         ''')
         
-        self.table.setStyleSheet(f'''
-            QTableWidget {{  
-                padding: 6px;
-                background: {theme['widget_bg']};
-                color: {theme['text_color']};
-                gridline-color: {theme['border_color']};
-                alternate-background-color: {theme['table_alternate_bg']};
-            }}
-            QTableWidget::item {{
-                border-radius: 0px;
-                padding: 4px;
-            }}
-            QTableWidget::item:selected {{
-                background: #3874f2;
-                color: white;
-            }}
-            QHeaderView {{
-                background: {theme['table_header_bg']};
-                color: {theme['text_color']};
-                border: none;
-                border-radius: 0px;
-            }}
-            QHeaderView::section {{
-                background: {theme['table_header_bg']};
-                color: {theme['text_color']};
-                padding: 4px;
-                border: 1px solid {theme['border_color']};
-            }}
-            QScrollBar:vertical {{
-                background: {theme['widget_bg']};
-                width: 16px;
-                margin: 2px;
-                border: none;
-            }}
-            QScrollBar::handle:vertical {{
-                background: {theme['border_color']};
-                min-height: 20px;
-                border-radius: 4px;
-            }}
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical {{
-                height: 0px;
-                background: none;
-                border: none;
-            }}
-            QScrollBar::add-page:vertical,
-            QScrollBar::sub-page:vertical {{
-                background: none;
-            }}
+        # Minimal table styling - preserve auto-resize behavior
+        self.table.setStyleSheet('''
+            QTableWidget {
+                alternate-background-color: palette(alternate-base);
+            }
+            QTableWidget::item:selected {
+                background: palette(highlight);
+                color: palette(highlighted-text);
+            }
         ''')
+        self.table.setAlternatingRowColors(True)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -271,7 +215,7 @@ class SettingsDialog(QDialog):
         form_layout.addRow(self.always_prompt_tag_checkbox)
         self.cache_per_set_checkbox = QCheckBox("Cache studio tags per set (not per file)")
         form_layout.addRow(self.cache_per_set_checkbox)
-        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         form_layout.addWidget(self.button_box)
@@ -580,131 +524,60 @@ class MainWindow(QWidget):
 
     def apply_theme(self):
         """Apply the current theme to the entire application"""
-        self.setStyleSheet(f'''
-            QWidget {{
-                background: {self.current_theme['window_bg']};
-                color: {self.current_theme['text_color']};
-            }}
-            QPushButton {{
-                background: {self.current_theme['button_bg']};
-                color: {self.current_theme['text_color']};
-                border: 1px solid {self.current_theme['border_color']};
+        # Qt6 handles most styling automatically through QPalette
+        app = QApplication.instance()
+        
+        # Use Qt's built-in styles
+        if self.current_theme == DARK_THEME:
+            # Try to use a native dark style if available
+            available_styles = QStyleFactory.keys()
+            if 'Fusion' in available_styles:
+                app.setStyle('Fusion')
+            
+            # Set dark palette
+            palette = QPalette()
+            palette.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
+            palette.setColor(QPalette.ColorRole.WindowText, QColor(224, 224, 224))
+            palette.setColor(QPalette.ColorRole.Base, QColor(45, 45, 45))
+            palette.setColor(QPalette.ColorRole.AlternateBase, QColor(60, 60, 60))
+            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(0, 0, 0))
+            palette.setColor(QPalette.ColorRole.ToolTipText, QColor(224, 224, 224))
+            palette.setColor(QPalette.ColorRole.Text, QColor(224, 224, 224))
+            palette.setColor(QPalette.ColorRole.Button, QColor(45, 45, 45))
+            palette.setColor(QPalette.ColorRole.ButtonText, QColor(224, 224, 224))
+            palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 255, 255))
+            palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
+            palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+            palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
+            app.setPalette(palette)
+        else:
+            # Use default light style
+            app.setStyle(QApplication.style().name())
+            app.setPalette(QApplication.style().standardPalette())
+        
+        # Minimal custom styling for specific needs
+        self.setStyleSheet('''
+            QPushButton {
                 padding: 8px 16px;
                 border-radius: 4px;
                 font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background: {self.current_theme['button_hover']};
-            }}
-            QPushButton:pressed {{
-                background: {self.current_theme['border_color']};
-            }}
-            QLabel {{
-                color: {self.current_theme['text_color']};
-                padding: 4px;
-            }}
-            QComboBox {{
-                background: {self.current_theme['widget_bg']};
-                color: {self.current_theme['text_color']};
-                border: 1px solid {self.current_theme['border_color']};
-                padding: 6px;
-                border-radius: 4px;
-            }}
-            QComboBox::drop-down {{
-                border: none;
-                width: 20px;
-            }}
-            QComboBox::down-arrow {{
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 5px solid {self.current_theme['text_color']};
-            }}
-            QComboBox QAbstractItemView {{
-                background: {self.current_theme['widget_bg']};
-                color: {self.current_theme['text_color']};
-                border: 1px solid {self.current_theme['border_color']};
-            }}
-            QTextEdit {{
-                background: {self.current_theme['log_bg']};
-                color: {self.current_theme['text_color']};
-                border: 1px solid {self.current_theme['border_color']};
+            }
+            QTextEdit {
                 border-radius: 4px;
                 padding: 8px;
-            }}
-            QTableWidget {{
-                background: {self.current_theme['widget_bg']};
-                color: {self.current_theme['text_color']};
-                gridline-color: {self.current_theme['border_color']};
-                alternate-background-color: {self.current_theme['table_alternate_bg']};
-            }}
-            QTableWidget::item {{
-                padding: 4px;
-            }}
-            QTableWidget::item:selected {{
-                background: #3874f2;
-                color: white;
-            }}
-            QHeaderView {{
-                background: {self.current_theme['table_header_bg']};
-                color: {self.current_theme['text_color']};
-            }}
-            QHeaderView::section {{
-                background: {self.current_theme['table_header_bg']};
-                color: {self.current_theme['text_color']};
-                padding: 4px;
-                border: 1px solid {self.current_theme['border_color']};
-            }}
-            QMenuBar {{
-                background: {self.current_theme['widget_bg']};
-                color: {self.current_theme['text_color']};
-                border-bottom: 1px solid {self.current_theme['border_color']};
-            }}
-            QMenuBar::item {{
-                background: transparent;
-                padding: 6px 12px;
-            }}
-            QMenuBar::item:selected {{
-                background: {self.current_theme['button_hover']};
-            }}
-            QMenu {{
-                background: {self.current_theme['widget_bg']};
-                color: {self.current_theme['text_color']};
-                border: 1px solid {self.current_theme['border_color']};
-            }}
-            QMenu::item {{
-                padding: 6px 20px;
-            }}
-            QMenu::item:selected {{
-                background: {self.current_theme['button_hover']};
-            }}
-            QMenu::separator {{
-                height: 1px;
-                background: {self.current_theme['border_color']};
-                margin: 4px 0px;
-            }}
-            QScrollBar:vertical {{
-                background: {self.current_theme['widget_bg']};
-                width: 16px;
-                margin: 2px;
-                border: none;
-            }}
-            QScrollBar::handle:vertical {{
-                background: {self.current_theme['border_color']};
-                min-height: 20px;
-                border-radius: 4px;
-            }}
-            QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical {{
-                height: 0px;
-                background: none;
-                border: none;
-            }}
-            QScrollBar::add-page:vertical,
-            QScrollBar::sub-page:vertical {{
-                background: none;
-            }}
+            }
+            QTableWidget {
+                alternate-background-color: palette(alternate-base);
+            }
+            QTableWidget::item:selected {
+                background: palette(highlight);
+                color: palette(highlighted-text);
+            }
         ''')
+        
+        # Enable alternating row colors for all tables
+        for table in self.findChildren(QTableWidget):
+            table.setAlternatingRowColors(True)
         
         # Update drop area theme
         self.drop_area.update_theme(self.current_theme)
@@ -744,7 +617,7 @@ class MainWindow(QWidget):
 
     def open_settings_dialog(self):
         dlg = SettingsDialog(self)
-        if dlg.exec_():
+        if dlg.exec():
             # Save the setting
             settings = load_settings()
             settings["auto_run_on_select"] = dlg.get_auto_run()
@@ -1123,7 +996,7 @@ class MainWindow(QWidget):
 
     def show_about(self):
         """Show the about dialog"""
-        from PyQt5.QtWidgets import QMessageBox
+        from PyQt6.QtWidgets import QMessageBox
         QMessageBox.about(self, "About Subtitle Renamer", 
                          "Subtitle Renamer v1.0\n\n"
                          "A tool for automatically renaming subtitle files to match video files.\n\n"
@@ -1133,11 +1006,11 @@ class MainWindow(QWidget):
                          "• Custom tag support\n"
                          "• Dark/Light theme support\n"
                          "• Batch processing\n\n"
-                         "Created with PyQt5")
+                         "Created with PyQt6")
 
     def show_help(self):
         """Show the help dialog"""
-        from PyQt5.QtWidgets import QMessageBox
+        from PyQt6.QtWidgets import QMessageBox
         help_text = """
 <b>Subtitle Renamer Help</b>
 
@@ -1184,4 +1057,4 @@ if __name__ == "__main__":
     
     window = MainWindow()
     window.show()
-    sys.exit(app.exec_()) 
+    sys.exit(app.exec()) 
