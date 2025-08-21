@@ -45,7 +45,7 @@ EPISODE_REGEX = r'\b(\d{1,2})(?:v\d+)?(?:[^\d\s]*)\b'  # TODO: upgrade to more r
 STUDIO_REGEX = r'\[(.*?)\]'
 
 # === Module Constants ===
-DEFAULT_SRC_EXT = '.ass' # account for the combobox default
+DEFAULT_SRC_EXT = '.ass'
 DEFAULT_DST_EXT = '.mkv'
 DEFAULT_CUST_EXT = ''
 
@@ -64,10 +64,6 @@ class RenameConfig:
     log_file: Optional[str] = None
 
 # === Utility Functions ===
-def remove_all_extensions(filename):
-    while '.' in filename:
-        filename = os.path.splitext(filename)[0]
-    return filename
 
 def extract_episode(filename):
     # Match the episode number and ignore any suffix
@@ -91,16 +87,9 @@ class UserCancelledPrompt(Exception):
 def prompt_for_extension(existing_extensions, studio_name, ask_fn=None, context="conflict"):
     """
     Prompt user for a custom extension/tag.
-    
-    Args:
-        existing_extensions: Set of existing extensions to avoid conflicts
-        studio_name: Default studio name to suggest
-        ask_fn: Function to get user input (for GUI)
-        context: Why the user is being prompted ("conflict", "always_prompt", or "multi_set")
     """
     ask = ask_fn or (lambda msg: input(msg).strip())
     
-    # Choose appropriate prompt based on context
     if context == "conflict":
         prompt = f"Found existing subtitle file. Enter a unique extension (default: {studio_name}): "
     elif context == "always_prompt":
@@ -132,18 +121,15 @@ so a folder that already contains Episode-01.Studio.ass is treated as if only Ep
 """
 def rename_files(config: RenameConfig):
     """
-    Optimized: Preprocess video and subtitle files for O(n + m) lookups.
     For each subtitle, find matching video(s) for the episode, check existing subtitle files for the same episode, and determine the new subtitle filename with appropriate extension/tag.
     If multiple subtitle files are found for the same episode, prompt for a unique extension.
     If no matching video is found, skip the subtitle.
     If multiple video files are found for the same episode, prompt for the correct video file.
     If the subtitle file already exists, skip it.
     If the subtitle file is already in the destination folder, skip it. 
-    Refactored: Always use the chosen tag for all files from a studio in the batch.
     
     Returns a dict: {"OK": [...], "FAIL": [...], "CANCELLED": [...]} where each list contains file paths
     """
-    logging.info(f"============================== New Job ==============================")
     results = {"OK": [], "FAIL": [], "CANCELLED": []}
     try:
         all_files = os.listdir(config.directory)
@@ -215,12 +201,11 @@ def rename_files(config: RenameConfig):
                                             default_name_conflict = True
                 # Only prompt if always_prompt_tag is True, or if there is a default name conflict
                 # Also check if we should prompt due to multiple subtitle sets per episode
-                if config.always_prompt_tag or default_name_conflict or config.always_prompt_multi:
+                if config.always_prompt_tag or default_name_conflict or (config.always_prompt_multi and len(studio_to_files) > 1):
                     # Determine the context for the prompt
-                    # Priority: actual conflicts > always_prompt_tag > always_prompt_multi
                     if default_name_conflict and not config.always_prompt_multi:
                         context = "conflict"
-                    elif config.always_prompt_multi:
+                    elif config.always_prompt_multi and len(studio_to_files) > 1:
                         context = "multi_set"
                     elif config.always_prompt_tag:
                         context = "always_prompt"
