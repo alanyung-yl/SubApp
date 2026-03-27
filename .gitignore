@@ -1,0 +1,53 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+wheels/
+
+# === Virtual environments ===
+.venv/
+venv/
+env/
+.env/
+
+# === PyInstaller ===
+dist/
+build/
+SubRename/dist/
+SubRename/build/
+
+# === pytest / testing ===
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# === App runtime files ===
+SubRename/log/
+SubRename/config/settings.json
+
+# === IDE / editor ===
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+Thumbs.db
+desktop.ini
+
+# === OS ===
+.DS_Store
+ehthumbs.db
+
+# === Misc project files ===
+others/
+*.zip
+
+.pytest_tmp/
+__pycache__/
+*.pyc
