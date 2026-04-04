@@ -8,7 +8,7 @@ A desktop application that renames subtitle files to match their corresponding v
 
 - [How It Works](#how-it-works)
 - [Download](#download)
-- [Security & Verification](#security&verification)
+- [Security & Verification](#security-&-verification)
 - [Quick Start](#quick-start)
 - [Basic Workflow](#basic-workflow)
 - [Series vs Movie Mode](#series-vs-movie-mode)
