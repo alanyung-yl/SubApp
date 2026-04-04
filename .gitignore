@@ -50,4 +50,5 @@ others/
 
 .pytest_tmp/
 __pycache__/
+tests/
 *.pyc

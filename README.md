@@ -8,6 +8,7 @@ A desktop application that renames subtitle files to match their corresponding v
 
 - [How It Works](#how-it-works)
 - [Download](#download)
+- [Security & Verification](#security&verification)
 - [Quick Start](#quick-start)
 - [Basic Workflow](#basic-workflow)
 - [Series vs Movie Mode](#series-vs-movie-mode)
@@ -55,6 +56,28 @@ If a renamed subtitle already exists at the destination, the app triggers confli
 | Linux | 🔜 Coming soon | — |
 
 > macOS and Linux builds are planned. See [ROADMAP.md](https://github.com/alanyung-yl/SubApp/blob/main/docs/ROADMAP.md) for details.
+
+---
+
+## Security & Verification
+
+Some antivirus software may flag `SubApp.exe` as suspicious. This is a known
+false positive affecting many apps built with PyInstaller, which packages the
+Python runtime and dependencies into a self-extracting executable — a pattern
+that AV heuristics sometimes misidentify.
+
+The source code is fully open and available in this repository for inspection.
+You can verify the integrity of the v1.0.0 release using the SHA-256 hash:
+```
+sha256: e3ef321d708ccada2ca9bd8350322908d172117d810a74454592a4910c40545b
+```
+
+To verify on Windows, run:
+```
+certutil -hashfile SubApp.exe SHA256
+```
+
+Independent scan: [VirusTotal results for v1.0.0](https://www.virustotal.com/gui/file/e3ef321d708ccada2ca9bd8350322908d172117d810a74454592a4910c40545b)
 
 ---
 
