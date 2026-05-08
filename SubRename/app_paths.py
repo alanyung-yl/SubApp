@@ -138,12 +138,25 @@ def log_dir(create: bool = False) -> Path:
     return p
 
 
+def history_dir(create: bool = False) -> Path:
+    """Persistent filesystem-operation state (separate from configuration)."""
+    base = _base_override()
+    p = (base / "history") if base else (_state_base() / VENDOR / APP / "history")
+    if create:
+        p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def settings_file() -> Path:
     return config_dir(False) / "settings.json"
 
 
 def rename_log_file() -> Path:
     return log_dir(False) / "rename_log.txt"
+
+
+def operation_history_file() -> Path:
+    return history_dir(False) / "operation_history.sqlite3"
 
 
 def user_langmap_file() -> Path:

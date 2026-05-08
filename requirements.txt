@@ -1,0 +1,5 @@
+PyQt6>=6.9.0
+guessit>=3.7.0
+rapidfuzz>=3.0.0
+pathvalidate>=3.0.0
+pywin32>=308; sys_platform == "win32"
