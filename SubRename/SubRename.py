@@ -54,6 +54,17 @@ class ConflictPolicy(Enum):
     SUFFIX = "SUFFIX"
 
 
+class PlanIssue(Enum):
+    """Internal issue classification for rename-plan rows."""
+    NONE = "NONE"
+    ON_DISK_COLLISION = "ON_DISK_COLLISION"
+    IN_BATCH_COLLISION = "IN_BATCH_COLLISION"
+    USER_ALWAYS_PROMPT = "USER_ALWAYS_PROMPT"
+    NO_MATCH = "NO_MATCH"
+    SOURCE_EQUALS_DEST = "SOURCE_EQUALS_DEST"
+    MANUAL_EDIT = "MANUAL_EDIT"
+
+
 # === Regex Constants ===
 EPISODE_REGEX = r'\b(?:S\d+E|E|Episode\s*)?(\d{1,4})(?:v\d+)?(?:[^\d\s]*)\b'  # Matches S01E01, E01, 01, Episode 01, etc.
 STUDIO_REGEX = r'\[(.*?)\]'
@@ -641,7 +652,7 @@ def prompt_for_tag(existing_tags, studio_name, ask_fn=None, context="conflict", 
     elif context == "always_prompt":
         prompt = f"Enter a custom suffix for {studio_name}"
     elif context == "multi_set":
-        prompt = f"Found multiple subtitles for the same episode. Enter a unique suffix for {studio_name}"
+        prompt = f"Found existing or multiple subtitles for the same episode. Enter a unique suffix for {studio_name}"
     else:
         prompt = f"Enter a unique suffix for {studio_name}"
 
@@ -673,53 +684,236 @@ def resolve_conflict(
     renamed_files: list[str],
     source_path: str,
     ask_cache: dict,
-) -> Tuple[str, str, str]:
+    renamed_source_by_path: Optional[dict[str, str]] = None,
+    include_metadata: bool = False,
+) -> Tuple[str, str, str] | Tuple[str, str, str, dict[str, Optional[str]]]:
     """
     Resolve a destination-file conflict.
 
     Returns (new_sub_name, new_path, status) where status is one of:
         "OK", "OVERWRITE", "SUFFIX", "SKIP", "SKIP_EXISTS"
     """
+    def done(
+        resolved_name: str,
+        resolved_path: str,
+        status: str,
+        issue_type: PlanIssue,
+        conflict_path: Optional[str] = None,
+        conflicting_source_path: Optional[str] = None,
+    ):
+        if include_metadata:
+            return resolved_name, resolved_path, status, {
+                "issue_type": issue_type.value,
+                "conflict_path": conflict_path,
+                "conflicting_source_path": conflicting_source_path,
+            }
+        return resolved_name, resolved_path, status
+
     src_norm = os.path.normcase(os.path.abspath(source_path))
     dst_norm = os.path.normcase(os.path.abspath(new_path))
     if src_norm == dst_norm:
-        return new_sub_name, new_path, "SKIP_EXISTS"
+        return done(new_sub_name, new_path, "SKIP_EXISTS", PlanIssue.SOURCE_EQUALS_DEST)
 
     in_batch_collision = new_path in renamed_files
     on_disk_collision = os.path.exists(new_path)
+    original_conflict_path = new_path if on_disk_collision else None
 
     if not in_batch_collision and not on_disk_collision:
-        return new_sub_name, new_path, "OK"
+        return done(new_sub_name, new_path, "OK", PlanIssue.NONE)
 
     # In-batch collisions always suffix regardless of policy
     if in_batch_collision:
-        base_name, ext = os.path.splitext(new_sub_name)
-        new_sub_name = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
-        new_path = os.path.join(config.directory, new_sub_name)
-        return new_sub_name, new_path, "SUFFIX"
+        conflicting_source_path = None
+        if renamed_source_by_path:
+            conflicting_source_path = renamed_source_by_path.get(new_path)
 
-    # Reuse preview conflict decisions in the actual run (avoid re-prompting)
-    if on_disk_collision:
-        pre = (config.pre_resolved_conflicts or {}).get(source_path)
+        pre_resolved = config.pre_resolved_conflicts or {}
+        pre = pre_resolved.get(source_path)
+        if pre is None:
+            pre = pre_resolved.get(os.path.normcase(os.path.abspath(source_path)))
         if pre:
             pre_status = pre.get("status")
             pre_name = (pre.get("new_name") or "").strip()
 
-            if pre_status == "OVERWRITE":
-                return new_sub_name, new_path, "OVERWRITE"
+            if pre_status == "SKIP":
+                return done(
+                    new_sub_name,
+                    new_path,
+                    "SKIP",
+                    PlanIssue.IN_BATCH_COLLISION,
+                    conflict_path=original_conflict_path,
+                    conflicting_source_path=conflicting_source_path,
+                )
 
             if pre_status in ("SUFFIX", "TAG"):
                 if pre_name:
                     pre_name = os.path.basename(pre_name)
                     pre_path = os.path.join(config.directory, pre_name)
                     if not (os.path.exists(pre_path) or pre_path in renamed_files):
-                        return pre_name, pre_path, pre_status
+                        return done(
+                            pre_name,
+                            pre_path,
+                            pre_status,
+                            PlanIssue.IN_BATCH_COLLISION,
+                            conflict_path=original_conflict_path,
+                            conflicting_source_path=conflicting_source_path,
+                        )
+
                 base_name, ext = os.path.splitext(new_sub_name)
                 fallback = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
-                return fallback, os.path.join(config.directory, fallback), "SUFFIX"
+                return done(
+                    fallback,
+                    os.path.join(config.directory, fallback),
+                    "SUFFIX",
+                    PlanIssue.IN_BATCH_COLLISION,
+                    conflict_path=original_conflict_path,
+                    conflicting_source_path=conflicting_source_path,
+                )
+
+        policy = config.conflict_policy
+        if policy == ConflictPolicy.ASK and ask_cache.get("apply_all"):
+            policy = ask_cache["cached_policy"]
+            if policy == ConflictPolicy.SKIP:
+                return done(
+                    new_sub_name,
+                    new_path,
+                    "SKIP",
+                    PlanIssue.IN_BATCH_COLLISION,
+                    conflict_path=original_conflict_path,
+                    conflicting_source_path=conflicting_source_path,
+                )
+            if policy == ConflictPolicy.SUFFIX and "cached_tag" in ask_cache:
+                cached_tag = ask_cache["cached_tag"]
+                base_name, ext = os.path.splitext(new_sub_name)
+                new_sub_name = f"{base_name}.{cached_tag}{ext}"
+                new_path = os.path.join(config.directory, new_sub_name)
+                if os.path.exists(new_path) or new_path in renamed_files:
+                    base_name, ext = os.path.splitext(new_sub_name)
+                    new_sub_name = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
+                    new_path = os.path.join(config.directory, new_sub_name)
+                return done(
+                    new_sub_name,
+                    new_path,
+                    "TAG",
+                    PlanIssue.IN_BATCH_COLLISION,
+                    conflict_path=original_conflict_path,
+                    conflicting_source_path=conflicting_source_path,
+                )
+
+        if policy == ConflictPolicy.ASK and config.conflict_resolver_fn:
+            orig_base = os.path.splitext(new_sub_name)[0]
+            try:
+                action, alt_path, apply_all = config.conflict_resolver_fn(
+                    source_path,
+                    new_path,
+                    new_sub_name,
+                    issue_type=PlanIssue.IN_BATCH_COLLISION.value,
+                    conflicting_source_path=conflicting_source_path,
+                    conflict_path=original_conflict_path,
+                    allow_overwrite=False,
+                    show_disabled_overwrite=True,
+                )
+            except TypeError as exc:
+                if "unexpected keyword" not in str(exc):
+                    raise
+                action, alt_path, apply_all = config.conflict_resolver_fn(
+                    source_path, new_path, new_sub_name
+                )
+
+            if apply_all:
+                if action in ("SUFFIX", "TAG", "OVERWRITE"):
+                    ask_cache["cached_policy"] = ConflictPolicy.SUFFIX
+                    if alt_path:
+                        alt_base = os.path.splitext(os.path.basename(alt_path))[0]
+                        if alt_base.startswith(orig_base + "."):
+                            ask_cache["cached_tag"] = alt_base[len(orig_base) + 1:]
+                elif action == "SKIP":
+                    ask_cache["cached_policy"] = ConflictPolicy.SKIP
+                ask_cache["apply_all"] = True
+
+            if action == "SKIP":
+                return done(
+                    new_sub_name,
+                    new_path,
+                    "SKIP",
+                    PlanIssue.IN_BATCH_COLLISION,
+                    conflict_path=original_conflict_path,
+                    conflicting_source_path=conflicting_source_path,
+                )
+            if action in ("SUFFIX", "TAG"):
+                if alt_path:
+                    new_sub_name = os.path.basename(alt_path)
+                    new_path = os.path.join(config.directory, new_sub_name)
+                    if os.path.exists(new_path) or new_path in renamed_files:
+                        base_name, ext = os.path.splitext(new_sub_name)
+                        new_sub_name = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
+                        new_path = os.path.join(config.directory, new_sub_name)
+                else:
+                    base_name, ext = os.path.splitext(new_sub_name)
+                    new_sub_name = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
+                    new_path = os.path.join(config.directory, new_sub_name)
+                return done(
+                    new_sub_name,
+                    new_path,
+                    ("TAG" if action == "TAG" and alt_path else "SUFFIX"),
+                    PlanIssue.IN_BATCH_COLLISION,
+                    conflict_path=original_conflict_path,
+                    conflicting_source_path=conflicting_source_path,
+                )
+
+        if policy == ConflictPolicy.SKIP:
+            return done(
+                new_sub_name,
+                new_path,
+                "SKIP",
+                PlanIssue.IN_BATCH_COLLISION,
+                conflict_path=original_conflict_path,
+                conflicting_source_path=conflicting_source_path,
+            )
+
+        base_name, ext = os.path.splitext(new_sub_name)
+        new_sub_name = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
+        new_path = os.path.join(config.directory, new_sub_name)
+        return done(
+            new_sub_name,
+            new_path,
+            "SUFFIX",
+            PlanIssue.IN_BATCH_COLLISION,
+            conflict_path=original_conflict_path,
+            conflicting_source_path=conflicting_source_path,
+        )
+
+    # Reuse preview conflict decisions in the actual run (avoid re-prompting)
+    if on_disk_collision:
+        pre_resolved = config.pre_resolved_conflicts or {}
+        pre = pre_resolved.get(source_path)
+        if pre is None:
+            pre = pre_resolved.get(os.path.normcase(os.path.abspath(source_path)))
+        if pre:
+            pre_status = pre.get("status")
+            pre_name = (pre.get("new_name") or "").strip()
+
+            if pre_status == "OVERWRITE":
+                return done(new_sub_name, new_path, "OVERWRITE", PlanIssue.ON_DISK_COLLISION, conflict_path=original_conflict_path)
+
+            if pre_status in ("SUFFIX", "TAG"):
+                if pre_name:
+                    pre_name = os.path.basename(pre_name)
+                    pre_path = os.path.join(config.directory, pre_name)
+                    if not (os.path.exists(pre_path) or pre_path in renamed_files):
+                        return done(pre_name, pre_path, pre_status, PlanIssue.ON_DISK_COLLISION, conflict_path=original_conflict_path)
+                base_name, ext = os.path.splitext(new_sub_name)
+                fallback = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
+                return done(
+                    fallback,
+                    os.path.join(config.directory, fallback),
+                    "SUFFIX",
+                    PlanIssue.ON_DISK_COLLISION,
+                    conflict_path=original_conflict_path,
+                )
 
             if pre_status == "SKIP":
-                return new_sub_name, new_path, "SKIP"
+                return done(new_sub_name, new_path, "SKIP", PlanIssue.ON_DISK_COLLISION, conflict_path=original_conflict_path)
 
     # On-disk collision: apply conflict policy
     policy = config.conflict_policy
@@ -737,7 +931,7 @@ def resolve_conflict(
                 base_name, ext = os.path.splitext(new_sub_name)
                 new_sub_name = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
                 new_path = os.path.join(config.directory, new_sub_name)
-            return new_sub_name, new_path, "TAG"
+            return done(new_sub_name, new_path, "TAG", PlanIssue.ON_DISK_COLLISION, conflict_path=original_conflict_path)
 
     if policy == ConflictPolicy.ASK:
         if config.conflict_resolver_fn:
@@ -759,7 +953,7 @@ def resolve_conflict(
                 ask_cache["apply_all"] = True
 
             if action == "OVERWRITE":
-                return new_sub_name, new_path, "OVERWRITE"
+                return done(new_sub_name, new_path, "OVERWRITE", PlanIssue.ON_DISK_COLLISION, conflict_path=original_conflict_path)
             elif action in ("SUFFIX", "TAG"):
                 if alt_path:
                     new_sub_name = os.path.basename(alt_path)
@@ -772,29 +966,35 @@ def resolve_conflict(
                     base_name, ext = os.path.splitext(new_sub_name)
                     new_sub_name = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
                     new_path = os.path.join(config.directory, new_sub_name)
-                return new_sub_name, new_path, ("TAG" if action == "TAG" and alt_path else "SUFFIX")
+                return done(
+                    new_sub_name,
+                    new_path,
+                    ("TAG" if action == "TAG" and alt_path else "SUFFIX"),
+                    PlanIssue.ON_DISK_COLLISION,
+                    conflict_path=original_conflict_path,
+                )
             else:
-                return new_sub_name, new_path, "SKIP"
+                return done(new_sub_name, new_path, "SKIP", PlanIssue.ON_DISK_COLLISION, conflict_path=original_conflict_path)
         else:
             # No resolver function, fall back to SUFFIX
             base_name, ext = os.path.splitext(new_sub_name)
             new_sub_name = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
             new_path = os.path.join(config.directory, new_sub_name)
-            return new_sub_name, new_path, "SUFFIX"
+            return done(new_sub_name, new_path, "SUFFIX", PlanIssue.ON_DISK_COLLISION, conflict_path=original_conflict_path)
 
     elif policy == ConflictPolicy.SKIP:
-        return new_sub_name, new_path, "SKIP"
+        return done(new_sub_name, new_path, "SKIP", PlanIssue.ON_DISK_COLLISION, conflict_path=original_conflict_path)
 
     elif policy == ConflictPolicy.OVERWRITE:
-        return new_sub_name, new_path, "OVERWRITE"
+        return done(new_sub_name, new_path, "OVERWRITE", PlanIssue.ON_DISK_COLLISION, conflict_path=original_conflict_path)
 
     elif policy == ConflictPolicy.SUFFIX:
         base_name, ext = os.path.splitext(new_sub_name)
         new_sub_name = generate_suffixed_path(base_name, ext, config.directory, renamed_files)
         new_path = os.path.join(config.directory, new_sub_name)
-        return new_sub_name, new_path, "SUFFIX"
+        return done(new_sub_name, new_path, "SUFFIX", PlanIssue.ON_DISK_COLLISION, conflict_path=original_conflict_path)
 
-    return new_sub_name, new_path, "OK"
+    return done(new_sub_name, new_path, "OK", PlanIssue.NONE)
 
 
 def rename_files(config: RenameConfig):
@@ -810,10 +1010,34 @@ def rename_files(config: RenameConfig):
     Returns a dict: {"OK": [...], "FAIL": [...], "SKIPPED": [...]} where each list contains file paths
     """
     renamed_files = []
+    renamed_source_by_path: dict[str, str] = {}
     results = {"OK": [], "FAIL": [], "SKIPPED": [], "RENAMED_PATHS": []}
     in_place = {os.path.normpath(p) for p in (config.rename_in_place_sources or set())}
     preview_rows: list[dict] = []
     ask_cache: dict = {}  # Per-run ASK cache for "Apply to all conflicts"
+
+    def make_preview_row(
+        source_path: str,
+        new_name: str,
+        status: str,
+        issue_type: PlanIssue | str = PlanIssue.NONE,
+        detected_group: str = "",
+        last_generated_name: str = "",
+        conflict_path: Optional[str] = None,
+        conflicting_source_path: Optional[str] = None,
+    ) -> dict:
+        issue_value = issue_type.value if isinstance(issue_type, PlanIssue) else str(issue_type)
+        return {
+            "source_path": source_path,
+            "new_name": new_name,
+            "status": status,
+            "issue_type": issue_value,
+            "manual_edited": False,
+            "detected_group": detected_group,
+            "last_generated_name": last_generated_name or new_name,
+            "conflict_path": conflict_path,
+            "conflicting_source_path": conflicting_source_path,
+        }
     try:
         all_files = os.listdir(config.directory)
         # Use provided video_files if given; else detect from directory by dst_ext
@@ -871,58 +1095,75 @@ def rename_files(config: RenameConfig):
             if cache_per_set and studio in studio_tags:
                 tag = studio_tags[studio]
             else:
-                # Gather all existing tags for this studio's files
+                # Gather existing tags and decide whether this group needs a
+                # naming-ambiguity prompt. Plain destination collisions are
+                # intentionally deferred to resolve_conflict().
                 existing_tags = set()
-                default_name_conflict = False
+                naming_ambiguity = False
+                destination_name_conflict = False
+                src_exts = [config.src_ext] if isinstance(config.src_ext, str) else config.src_ext
                 
-                # Check for conflicts: existing files in target directory + episodes already processed in this job
+                # Check for naming ambiguity: existing tagged files and episodes
+                # already processed in this job. Existing base-name files are
+                # destination conflicts, not group-suffix ambiguity.
                 for s in files:
+                    source_norm = os.path.normcase(os.path.abspath(s))
                     if movie_mode:
-                        # Movie mode: Check for conflicts with any video file
-                        subtitle_name = os.path.basename(s)
+                        # Movie mode: Check for related subtitles with any video file
                         for video_file in video_files:
                             video_base = os.path.splitext(video_file)[0]
                             
-                            # Check for existing subtitle files in target directory
-                            potential_subtitle_name = f"{video_base}{config.src_ext}"
-                            if os.path.exists(os.path.join(config.directory, potential_subtitle_name)):
-                                default_name_conflict = True
+                            # Existing bare subtitle names are handled by the conflict resolver.
+                            for src_ext in src_exts:
+                                potential_subtitle_name = f"{video_base}{src_ext}"
+                                potential_subtitle_path = os.path.join(config.directory, potential_subtitle_name)
+                                potential_norm = os.path.normcase(os.path.abspath(potential_subtitle_path))
+                                if os.path.exists(potential_subtitle_path) and potential_norm != source_norm:
+                                    destination_name_conflict = True
                             
                             # Also check for existing subtitle files with tags
                             for existing_file in all_files:
-                                if existing_file.endswith(config.src_ext):
+                                if match_extension(existing_file, config.src_ext):
                                     existing_base = os.path.splitext(existing_file)[0]
                                     if existing_base.startswith(video_base + "."):
                                         tag_part = existing_base[len(video_base) + 1:]
                                         if tag_part:
                                             existing_tags.add(tag_part)
-                                            default_name_conflict = True
+                                            naming_ambiguity = True
                     else:
-                        # Series mode: Check for conflicts with episode-based matching
+                        # Series mode: Check for ambiguity with episode-based matching
                         episode = extract_episode(os.path.basename(s))
                         if episode is not None:
                             # Check if this episode was already processed by a previous studio in this job
                             if episode in processed_episodes_in_job:
-                                default_name_conflict = True
+                                naming_ambiguity = True
                             
-                            video_files = episode_to_video.get(episode, [])
-                            if video_files:
-                                video_base = os.path.splitext(video_files[0])[0]
+                            ep_video_files = episode_to_video.get(episode, [])
+                            if ep_video_files:
+                                video_base = os.path.splitext(ep_video_files[0])[0]
                                 
-                                # Check for existing subtitle files in target directory
-                                potential_subtitle_name = f"{video_base}{config.src_ext}"
-                                if os.path.exists(os.path.join(config.directory, potential_subtitle_name)):
-                                    default_name_conflict = True
+                                # Existing bare subtitle names are handled by the conflict resolver.
+                                for src_ext in src_exts:
+                                    potential_subtitle_name = f"{video_base}{src_ext}"
+                                    potential_subtitle_path = os.path.join(config.directory, potential_subtitle_name)
+                                    potential_norm = os.path.normcase(os.path.abspath(potential_subtitle_path))
+                                    if os.path.exists(potential_subtitle_path) and potential_norm != source_norm:
+                                        destination_name_conflict = True
                                 
                                 # Also check for existing subtitle files with tags
                                 for existing_file in all_files:
-                                    if existing_file.endswith(config.src_ext):
+                                    if match_extension(existing_file, config.src_ext):
                                         existing_base = os.path.splitext(existing_file)[0]
                                         if existing_base.startswith(video_base + "."):
                                             tag_part = existing_base[len(video_base) + 1:]
                                             if tag_part:
                                                 existing_tags.add(tag_part)
-                                                default_name_conflict = True
+                                                naming_ambiguity = True
+                if destination_name_conflict:
+                    logging.debug(
+                        "Destination name conflict detected for studio %s; deferring to conflict resolver",
+                        studio,
+                    )
                 # Use studio name as tag automatically if it's not the hardcoded fallback
                 should_use_default_tag = False
                 if config.use_default_tag and len(studio_to_files) > 1 and studio != DEFAULT_TAG:
@@ -933,21 +1174,31 @@ def rename_files(config: RenameConfig):
                 
                 # Naming ambiguity
                 # Prompt if:
-                # 1. In preview mode AND (always_prompt_tag OR conflict conditions), OR
-                # 2. In rename mode AND (not config.preview_mode AND (always_prompt_tag OR conflict conditions))
-                # 3. OR if use_default_tag is enabled but studio is "DEFAULT_TAG" or not found (fallback case)
-                # DON'T prompt if: done preview and onto rename mode (not config.preview_mode and ui_preview_mode flag)
+                # 1. In preview mode AND a group suffix decision is needed, OR
+                # 2. In rename mode AND no preview/custom names are available to reuse.
+                # Destination-file conflicts are handled later by resolve_conflict().
                 should_prompt = False
+                prompt_needed = (
+                    config.always_prompt_tag
+                    or (naming_ambiguity and config.conflict_resolver_fn is None)
+                    or (destination_name_conflict and config.conflict_resolver_fn is None)
+                    or (config.use_default_tag and len(studio_to_files) > 1)
+                )
+                has_preview_decisions = bool(config.custom_names or config.pre_resolved_conflicts)
+                preview_decisions_cover_prompt = (
+                    not config.preview_mode
+                    and config.ui_preview_mode
+                    and not config.auto_run
+                    and has_preview_decisions
+                )
                 # Ambiguity/tag prompts only matter when group suffix is enabled.
                 if not config.group_suffix_enabled:
                     should_prompt = False
                 elif should_use_default_tag:
                     should_prompt = False
-                elif config.preview_mode and (config.always_prompt_tag or default_name_conflict or (config.use_default_tag and len(studio_to_files) > 1)):
+                elif config.preview_mode and prompt_needed:
                     should_prompt = True
-                elif not config.preview_mode and not config.ui_preview_mode and (config.always_prompt_tag or default_name_conflict or (config.use_default_tag and len(studio_to_files) > 1)):
-                    should_prompt = True
-                elif not config.preview_mode and config.ui_preview_mode and config.auto_run and (config.always_prompt_tag or default_name_conflict or (config.use_default_tag and len(studio_to_files) > 1)):
+                elif not config.preview_mode and not preview_decisions_cover_prompt and prompt_needed:
                     should_prompt = True
 
                 if movie_mode and should_prompt:
@@ -964,14 +1215,14 @@ def rename_files(config: RenameConfig):
                         should_prompt = False
                 
                 if should_prompt:
-                    if default_name_conflict:
-                        context = "conflict"
+                    if naming_ambiguity:
+                        context = "multi_set"
                     elif config.use_default_tag and len(studio_to_files) > 1:
                         context = "multi_set"
                     elif config.always_prompt_tag:
                         context = "always_prompt"
                     else:
-                        context = "conflict"
+                        context = "multi_set"
 
                     if cache_per_set:  # Prompt once for the entire studio set
                         try:
@@ -984,11 +1235,13 @@ def rename_files(config: RenameConfig):
                             logging.info(f"User skipped studio {studio}; skipping all files from this studio.")
                             for source_path in files:
                                 if config.preview_mode:
-                                    preview_rows.append({
-                                        "source_path": source_path,
-                                        "new_name": "",
-                                        "status": "SKIP",
-                                    })
+                                    preview_rows.append(make_preview_row(
+                                        source_path,
+                                        "",
+                                        "SKIP",
+                                        PlanIssue.USER_ALWAYS_PROMPT if config.always_prompt_tag else PlanIssue.NONE,
+                                        detected_group=studio,
+                                    ))
                                 else: 
                                     results["SKIPPED"].append(source_path)
                             continue
@@ -1007,11 +1260,13 @@ def rename_files(config: RenameConfig):
                         if matching_video is None:
                             logging.info(f"SKIPPED: No matching video file found for subtitle: {source_filename} (best similarity: {similarity_score:.2f})")
                             if config.preview_mode:
-                                preview_rows.append({
-                                    "source_path": source_path,
-                                    "new_name": "",
-                                    "status": "FAIL",
-                                })
+                                preview_rows.append(make_preview_row(
+                                    source_path,
+                                    "",
+                                    "FAIL",
+                                    PlanIssue.NO_MATCH,
+                                    detected_group=studio,
+                                ))
                             else:
                                 results["FAIL"].append(source_path)
                             continue
@@ -1027,18 +1282,29 @@ def rename_files(config: RenameConfig):
                         if episode is None:
                             # print(f"Could not extract episode from source filename: {source_filename}")
                             logging.error(f"Could not extract episode from source filename: {source_filename}")
-                            results["FAIL"].append(source_path)
+                            if config.preview_mode:
+                                preview_rows.append(make_preview_row(
+                                    source_path,
+                                    "",
+                                    "FAIL",
+                                    PlanIssue.NO_MATCH,
+                                    detected_group=studio,
+                                ))
+                            else:
+                                results["FAIL"].append(source_path)
                             continue
                         matching_videos = episode_to_video.get(episode, [])
                         if not matching_videos:
                             # print(f"Skipped: No matching video file found for episode {episode}")
                             logging.info(f"SKIPPED: No matching video file found for episode {episode}")
                             if config.preview_mode:
-                                preview_rows.append({
-                                    "source_path": source_path,
-                                    "new_name": "",
-                                    "status": "FAIL",
-                                })
+                                preview_rows.append(make_preview_row(
+                                    source_path,
+                                    "",
+                                    "FAIL",
+                                    PlanIssue.NO_MATCH,
+                                    detected_group=studio,
+                                ))
                             else:
                                 results["FAIL"].append(source_path)
                             continue
@@ -1070,11 +1336,13 @@ def rename_files(config: RenameConfig):
                             except UserCancelledPrompt:
                                 logging.info(f"User skipped file: {source_filename}")
                                 if config.preview_mode:
-                                    preview_rows.append({
-                                        "source_path": source_path,
-                                        "new_name": "",
-                                        "status": "SKIP",
-                                    })
+                                    preview_rows.append(make_preview_row(
+                                        source_path,
+                                        "",
+                                        "SKIP",
+                                        PlanIssue.USER_ALWAYS_PROMPT if config.always_prompt_tag else PlanIssue.NONE,
+                                        detected_group=studio,
+                                    ))
                                 else:
                                     results["SKIPPED"].append(source_path)
                                 continue
@@ -1106,18 +1374,35 @@ def rename_files(config: RenameConfig):
                         else:
                             new_sub_name = f"{video_base}{original_ext}"
 
+                    last_generated_name = new_sub_name
+                    prompt_issue = PlanIssue.USER_ALWAYS_PROMPT if config.always_prompt_tag and not custom_name else PlanIssue.NONE
                     new_path = os.path.join(config.directory, new_sub_name)
-                    new_sub_name, new_path, conflict_status = resolve_conflict(
-                        new_sub_name, new_path, config, renamed_files, source_path, ask_cache,
+                    new_sub_name, new_path, conflict_status, conflict_meta = resolve_conflict(
+                        new_sub_name,
+                        new_path,
+                        config,
+                        renamed_files,
+                        source_path,
+                        ask_cache,
+                        renamed_source_by_path=renamed_source_by_path,
+                        include_metadata=True,
                     )
+                    issue_type = conflict_meta.get("issue_type") or PlanIssue.NONE.value
+                    if issue_type == PlanIssue.NONE.value and prompt_issue != PlanIssue.NONE:
+                        issue_type = prompt_issue.value
 
                     if conflict_status == "SKIP":
                         if config.preview_mode:
-                            preview_rows.append({
-                                "source_path": source_path,
-                                "new_name": new_sub_name,
-                                "status": "SKIP",
-                            })
+                            preview_rows.append(make_preview_row(
+                                source_path,
+                                new_sub_name,
+                                "SKIP",
+                                issue_type,
+                                detected_group=studio,
+                                last_generated_name=last_generated_name,
+                                conflict_path=conflict_meta.get("conflict_path"),
+                                conflicting_source_path=conflict_meta.get("conflicting_source_path"),
+                            ))
                         else:
                             logging.info(f"SKIPPED (conflict policy): {source_filename}")
                             results["SKIPPED"].append(source_path)
@@ -1125,23 +1410,34 @@ def rename_files(config: RenameConfig):
 
                     if conflict_status == "SKIP_EXISTS":
                         if config.preview_mode:
-                            preview_rows.append({
-                                "source_path": source_path,
-                                "new_name": new_sub_name,
-                                "status": "SKIP_EXISTS",
-                            })
+                            preview_rows.append(make_preview_row(
+                                source_path,
+                                new_sub_name,
+                                "SKIP_EXISTS",
+                                issue_type,
+                                detected_group=studio,
+                                last_generated_name=last_generated_name,
+                                conflict_path=conflict_meta.get("conflict_path"),
+                                conflicting_source_path=conflict_meta.get("conflicting_source_path"),
+                            ))
                         else:
                             logging.info(f"SKIPPED (same file): {source_filename}")
                             results["SKIPPED"].append(source_path)
                         continue
 
                     renamed_files.append(new_path)
+                    renamed_source_by_path[new_path] = source_path
                     if config.preview_mode:
-                        preview_rows.append({
-                            "source_path": source_path,
-                            "new_name": new_sub_name,
-                            "status": conflict_status,  # OK, OVERWRITE, or SUFFIX
-                        })
+                        preview_rows.append(make_preview_row(
+                            source_path,
+                            new_sub_name,
+                            conflict_status,  # OK, OVERWRITE, SUFFIX, or TAG
+                            issue_type,
+                            detected_group=studio,
+                            last_generated_name=last_generated_name,
+                            conflict_path=conflict_meta.get("conflict_path"),
+                            conflicting_source_path=conflict_meta.get("conflicting_source_path"),
+                        ))
                     else:
                         if conflict_status == "OVERWRITE" and os.path.exists(new_path):
                             send2trash(os.path.normpath(new_path))
@@ -1167,7 +1463,16 @@ def rename_files(config: RenameConfig):
                         
                 except Exception as e:
                     logging.error(f"Error processing {source_path}: {e}")
-                    results["FAIL"].append(source_path)
+                    if config.preview_mode:
+                        preview_rows.append(make_preview_row(
+                            source_path,
+                            "",
+                            "FAIL",
+                            PlanIssue.NO_MATCH,
+                            detected_group=studio,
+                        ))
+                    else:
+                        results["FAIL"].append(source_path)
     except Exception as e:
         logging.error(f"Error in rename_files: {e}")
     

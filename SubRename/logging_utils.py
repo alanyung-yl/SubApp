@@ -97,23 +97,38 @@ def log_success(message):
 
 def setup_logging(log_file):
     """Set up logging with custom filtered handler"""
-    # Only set up if no handlers exist
-    if not logging.getLogger().hasHandlers():
-        level = _env_log_level()
-        log_path = Path(log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+    level = _env_log_level()
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    logger = logging.getLogger()
+    logger.setLevel(level)
+
+    resolved_log_path = str(log_path.resolve(strict=False))
+    file_handler = None
+    for handler in logger.handlers:
+        if not isinstance(handler, FilteredFileHandler):
+            continue
+        handler_path = Path(getattr(handler, "baseFilename", "")).resolve(strict=False)
+        if str(handler_path) == resolved_log_path:
+            file_handler = handler
+            break
+
+    if file_handler is None:
         file_handler = FilteredFileHandler(str(log_path))
-        file_handler.setFormatter(formatter)
-        file_handler.setLevel(level)
-        
-        # Configure the root logger
-        logger = logging.getLogger()
-        logger.setLevel(level)
         logger.addHandler(file_handler)
 
-        if ap._env_flag("SUBRENAME_LOG_CONSOLE", False):
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(level)
+
+    if ap._env_flag("SUBRENAME_LOG_CONSOLE", False):
+        has_console = any(
+            isinstance(handler, logging.StreamHandler)
+            and not isinstance(handler, logging.FileHandler)
+            for handler in logger.handlers
+        )
+        if not has_console:
             console = logging.StreamHandler()
             console.setFormatter(formatter)
             console.setLevel(level)
