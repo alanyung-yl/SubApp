@@ -470,8 +470,14 @@ class SubCol(IntEnum):
     PLAN_STATUS = 3
 
 
-def plan_status_text(status: str) -> str:
-    compact_text, full_text = PLAN_STATUS_DISPLAY.get(status or "PENDING", PLAN_STATUS_DISPLAY["PENDING"])
+def plan_display_status(status: str, issue_type: str | None = None) -> str:
+    if status == "OK" and issue_type == "USER_ALWAYS_PROMPT":
+        return "TAG"
+    return status
+
+def plan_status_text(status: str, issue_type: str | None = None) -> str:
+    display_status = plan_display_status(status or "PENDING", issue_type)
+    compact_text, full_text = PLAN_STATUS_DISPLAY.get(display_status, PLAN_STATUS_DISPLAY["PENDING"])
     return compact_text if get_compact_mode() else full_text
 
 # ─── settings helpers ──────────────────────────────────────────────────────────────
@@ -1290,9 +1296,10 @@ class DropArea(QFrame):
                 self.row_plan_by_source[file_path] = {
                     "source_path": file_path,
                     "issue_type": "NONE",
-                    "manual_edited": False,
+                    "user_modified": False,
                     "detected_group": "",
                     "last_generated_name": "",
+                    "clean_generated_name": "",
                     "conflict_path": None,
                     "conflicting_source_path": None,
                     "plan_status": "PENDING",
@@ -1336,13 +1343,18 @@ class DropArea(QFrame):
 
                 preview_info = preview_map[source_path]
                 meta = self.row_plan_by_source.setdefault(source_path, {})
-                was_manual = bool(meta.get("manual_edited"))
+                was_user_modified = bool(meta.get("user_modified"))
                 generated_meta = {
                     "source_path": source_path,
                     "detected_group": preview_info.get("detected_group", ""),
                     "last_generated_name": preview_info.get("last_generated_name") or preview_info.get("new_name", ""),
+                    "clean_generated_name": (
+                        preview_info.get("clean_generated_name")
+                        or preview_info.get("last_generated_name")
+                        or preview_info.get("new_name", "")
+                    ),
                 }
-                if not was_manual:
+                if not was_user_modified:
                     generated_meta.update({
                         "issue_type": preview_info.get("issue_type", "NONE"),
                         "conflict_path": preview_info.get("conflict_path"),
@@ -1355,12 +1367,12 @@ class DropArea(QFrame):
                 if not new_name_item or not preview_item:
                     continue
 
-                if not was_manual:
+                if not was_user_modified:
                     new_name = preview_info.get("new_name", "")
                     status = preview_info.get("status", "PENDING")
                     new_name_item.setText(new_name)
                     new_name_item.setToolTip(new_name or "No planned filename")
-                    preview_item.setText(plan_status_text(status))
+                    preview_item.setText(plan_status_text(status, preview_info.get("issue_type")))
                     preview_item.setToolTip(self._plan_tooltip(preview_info))
                     meta["plan_status"] = status
                     self._previous_rename_values[source_path] = new_name
@@ -1382,11 +1394,12 @@ class DropArea(QFrame):
             parts.append(f"Already used by: {info['conflicting_source_path']}")
         return "\n".join(parts) if parts else "Ready"
 
-    def get_custom_names(self):
+    def get_custom_names(self, base_name_sources: set[str] | None = None):
         """
         Collect custom names from the table's "Rename To" column.
         Returns a dict mapping source_path -> custom_new_name
         """
+        base_name_sources = base_name_sources or set()
         custom_names = {}
         if not self.table.isVisible():
             return custom_names
@@ -1398,6 +1411,9 @@ class DropArea(QFrame):
             if path_item and new_name_item:
                 source_path = path_item.text()
                 custom_name = new_name_item.text().strip()
+                if source_path in base_name_sources:
+                    meta = self.row_plan_by_source.get(source_path, {})
+                    custom_name = (meta.get("last_generated_name") or custom_name).strip()
                 
                 if custom_name:  # Only include if the custom name is not empty
                     custom_names[source_path] = custom_name
@@ -1577,6 +1593,10 @@ class SettingsDialog(QDialog):
         behavior_layout = QFormLayout(behavior_group)
         self.delete_empty_folders_checkbox = QCheckBox("Delete Empty Folders When Deleting Subtitle Files")
         behavior_layout.addRow(self.delete_empty_folders_checkbox)
+        self.exclude_completed_from_run_checkbox = QCheckBox("Skip Completed Rows When Renaming")
+        behavior_layout.addRow(self.exclude_completed_from_run_checkbox)
+        self.exclude_completed_from_preview_checkbox = QCheckBox("Skip Completed Rows When Refreshing Plan")
+        behavior_layout.addRow(self.exclude_completed_from_preview_checkbox)
         self.preview_mode_checkbox = QCheckBox("Enable Preview Mode")
         layout.addWidget(behavior_group)
 
@@ -1798,6 +1818,8 @@ class SettingsDialog(QDialog):
         self.conflict_policy_combo.setCurrentIndex(policy_map.get(policy, 0))
         self.preview_mode_checkbox.setChecked(settings.get("preview_mode", True))
         self.delete_empty_folders_checkbox.setChecked(settings.get("delete_empty_folders", False))
+        self.exclude_completed_from_run_checkbox.setChecked(settings.get("exclude_completed_from_run", True))
+        self.exclude_completed_from_preview_checkbox.setChecked(settings.get("exclude_completed_from_preview", False))
 
         # Language settings
         self.group_suffix_checkbox.setChecked(settings.get("group_suffix_enabled", True))
@@ -1841,6 +1863,8 @@ class SettingsDialog(QDialog):
             'apply_all_conflicts': self.apply_all_conflicts_checkbox.isChecked(),
             'conflict_policy': ["ASK", "SKIP", "OVERWRITE", "SUFFIX"][self.conflict_policy_combo.currentIndex()],
             'preview_mode': self.preview_mode_checkbox.isChecked(),
+            'exclude_completed_from_run': self.exclude_completed_from_run_checkbox.isChecked(),
+            'exclude_completed_from_preview': self.exclude_completed_from_preview_checkbox.isChecked(),
             'show_preview_name_column': self.show_preview_name_checkbox.isChecked(),
             'show_preview_status_column': self.show_preview_status_checkbox.isChecked(),
             'dark_mode': self.theme_combo.currentIndex() == 1,
@@ -1881,6 +1905,8 @@ class SettingsDialog(QDialog):
         self.use_default_tag_checkbox.toggled.connect(self.mark_changed)
         self.always_prompt_tag_checkbox.toggled.connect(self.mark_changed)
         self.cache_per_set_checkbox.toggled.connect(self.mark_changed)
+        self.exclude_completed_from_run_checkbox.toggled.connect(self.mark_changed)
+        self.exclude_completed_from_preview_checkbox.toggled.connect(self.mark_changed)
         self.conflict_policy_combo.currentIndexChanged.connect(self.mark_changed)
         self.preview_mode_checkbox.toggled.connect(self.on_preview_mode_toggled)
         self.theme_combo.currentIndexChanged.connect(self.mark_changed)
@@ -1964,6 +1990,8 @@ class SettingsDialog(QDialog):
         settings["apply_all_conflicts"] = self.apply_all_conflicts_checkbox.isChecked()
         settings["conflict_policy"] = ["ASK", "SKIP", "OVERWRITE", "SUFFIX"][self.conflict_policy_combo.currentIndex()]
         settings["preview_mode"] = self.preview_mode_checkbox.isChecked()
+        settings["exclude_completed_from_run"] = self.exclude_completed_from_run_checkbox.isChecked()
+        settings["exclude_completed_from_preview"] = self.exclude_completed_from_preview_checkbox.isChecked()
         settings["show_preview_name_column"] = self.show_preview_name_checkbox.isChecked()
         settings["show_preview_status_column"] = self.show_preview_status_checkbox.isChecked()
         settings["delete_empty_folders"] = self.delete_empty_folders_checkbox.isChecked()
@@ -3122,8 +3150,32 @@ class MainWindow(QWidget):
         if self.target_folder and self.selected_files and not self.adding_orphaned_files:
             self.run_renamer(preview_mode=True)
 
+    def files_for_job(self, preview_mode: bool, settings: dict | None = None) -> list[str]:
+        """Return the subtitle files that should participate in this run."""
+        settings = settings or load_settings()
+        if preview_mode:
+            skip_completed = settings.get("exclude_completed_from_preview", False)
+        else:
+            skip_completed = settings.get("exclude_completed_from_run", True)
+
+        if not skip_completed:
+            if preview_mode:
+                return list(self.selected_files)
+            return [
+                path for path in self.selected_files
+                if self.drop_area.row_plan_by_source.get(path, {}).get("plan_status") != "SKIP"
+            ]
+        return [
+            path for path in self.selected_files
+            if self.subtitle_status.get(path) != "success"
+            and (
+                preview_mode
+                or self.drop_area.row_plan_by_source.get(path, {}).get("plan_status") != "SKIP"
+            )
+        ]
+
     def regenerate_rename_plan(self):
-        """Explicitly rebuild the full rename plan and clear manual row edits."""
+        """Explicitly rebuild the full rename plan and clear user row edits."""
         if not self.target_folder:
             self.log("<b>Please select the destination folder first.</b>", "warning")
             return
@@ -3133,10 +3185,10 @@ class MainWindow(QWidget):
 
         self.preview_conflict_decisions.clear()
         for meta in self.drop_area.row_plan_by_source.values():
-            meta["manual_edited"] = False
+            meta["user_modified"] = False
             meta["issue_type"] = "NONE"
             meta["plan_status"] = "PENDING"
-        self.run_renamer(preview_mode=True)
+        self.maybe_generate_rename_plan()
 
     def set_target_folder(self, folder: str):
         """Apply a target folder from browse, recent-folder, or drag/drop import."""
@@ -3597,6 +3649,18 @@ class MainWindow(QWidget):
                 group_suffix_enabled = settings.get("group_suffix_enabled", True)
                 lang_suffix_enabled = settings.get("lang_suffix_enabled", False)
                 unknown_lang_action = settings.get("unknown_lang_action", "append")
+                files_to_process = self.files_for_job(preview_mode, settings)
+                if not preview_mode and not files_to_process:
+                    completed_count = len([
+                        path for path in self.selected_files
+                        if self.subtitle_status.get(path) == "success"
+                    ])
+                    if completed_count:
+                        self.log(f"<b>No pending files to rename. {completed_count} completed row(s) are skipped.</b>", "warning")
+                    else:
+                        self.log("<b>No pending files to rename.</b>", "warning")
+                    self.job_completed_signal.emit()
+                    return
 
                 def ask_user_with_title(prompt: str, filename: str | None = None) -> str:
                     title = "Rename Plan" if preview_mode else "SubApp"
@@ -3614,12 +3678,24 @@ class MainWindow(QWidget):
                 # Collect custom names from the table if not in preview mode
                 custom_names = None
                 if not preview_mode:
-                    custom_names = self.drop_area.get_custom_names()
+                    action_statuses = {"OVERWRITE", "SUFFIX", "TAG", "SKIP"}
+                    action_base_sources = set()
+                    for path in files_to_process:
+                        row_meta = self.drop_area.row_plan_by_source.get(path, {})
+                        if (
+                            self.subtitle_status.get(path) == "success"
+                            or path in self.preview_conflict_decisions
+                            or row_meta.get("plan_status") in action_statuses
+                        ):
+                            action_base_sources.add(path)
+                    custom_names = self.drop_area.get_custom_names(
+                        base_name_sources=action_base_sources
+                    )
 
                 pre_resolved_conflicts = None if preview_mode else (
                     dict(self.preview_conflict_decisions) if self.preview_conflict_decisions else None
                 )
-                in_place = self.rename_in_place_paths & set(self.selected_files) if not preview_mode else None
+                in_place = self.rename_in_place_paths & set(files_to_process) if not preview_mode else None
 
                 config = sr.RenameConfig(
                     directory=self.target_folder,
@@ -3627,7 +3703,7 @@ class MainWindow(QWidget):
                     dst_ext=self.dst_ext,
                     cust_ext=self.cust_ext,
                     ask_fn=ask_user_with_title,
-                    subtitle_files=self.selected_files,
+                    subtitle_files=files_to_process,
                     video_files=self.get_current_video_files(),
                     auto_run=auto_run,
                     use_default_tag=use_default_tag,
@@ -4166,6 +4242,38 @@ class MainWindow(QWidget):
             for file_path in results.get("SKIPPED", []):
                 self.subtitle_status[file_path] = "skipped"
 
+            previous_suppression = self.drop_area._suppress_item_changed
+            self.drop_area._suppress_item_changed = True
+            try:
+                for meta in results.get("ROW_META", []):
+                    source_path = meta.get("source_path")
+                    if not source_path:
+                        continue
+                    for row in range(self.drop_area.table.rowCount()):
+                        path_item = self.drop_area.table.item(row, SubCol.PATH)
+                        if not path_item or path_item.text() != source_path:
+                            continue
+                        new_name = meta.get("new_name", "")
+                        if new_name:
+                            self._set_rename_to(row, new_name)
+                        conflict_status = meta.get("conflict_status", "OK")
+                        issue_type = meta.get("issue_type", "NONE")
+                        existing_meta = self.drop_area.row_plan_by_source.setdefault(source_path, {})
+                        if meta.get("last_generated_name"):
+                            existing_meta["last_generated_name"] = meta["last_generated_name"]
+                        if meta.get("clean_generated_name"):
+                            existing_meta["clean_generated_name"] = meta["clean_generated_name"]
+                        if (
+                            conflict_status == "OK"
+                            and issue_type == "NONE"
+                            and existing_meta.get("issue_type") == "USER_ALWAYS_PROMPT"
+                        ):
+                            issue_type = "USER_ALWAYS_PROMPT"
+                        self._set_plan_status(row, conflict_status, issue_type)
+                        break
+            finally:
+                self.drop_area._suppress_item_changed = previous_suppression
+
             # Apply in-place renames: remap table rows to new paths
             for entry in results.get("RENAMED_PATHS", []):
                 old_path = entry["source_path"]
@@ -4208,18 +4316,19 @@ class MainWindow(QWidget):
         item = self.drop_area.table.item(row, SubCol.RENAME_TO)
         if not item:
             return
+        previous_suppression = self.drop_area._suppress_item_changed
         self.drop_area._suppress_item_changed = True
         try:
             item.setText(value)
             item.setToolTip(value or "No planned filename")
         finally:
-            self.drop_area._suppress_item_changed = False
+            self.drop_area._suppress_item_changed = previous_suppression
 
     def _set_plan_status(self, row: int, status: str, issue_type: str | None = None):
         source_path = self._row_source_path(row)
         item = self.drop_area.table.item(row, SubCol.PLAN_STATUS)
         if item:
-            item.setText(plan_status_text(status))
+            item.setText(plan_status_text(status, issue_type))
         if source_path:
             meta = self.drop_area.row_plan_by_source.setdefault(source_path, {})
             meta["plan_status"] = status
@@ -4300,7 +4409,7 @@ class MainWindow(QWidget):
             return
 
         meta = self.drop_area.row_plan_by_source.setdefault(source_path, {})
-        meta["manual_edited"] = True
+        meta["user_modified"] = True
         meta["issue_type"] = "MANUAL_EDIT"
         self.drop_area._previous_rename_values[source_path] = new_name
 
@@ -4336,7 +4445,6 @@ class MainWindow(QWidget):
         issue_type = meta.get("issue_type", "NONE")
 
         menu = AdaptiveRoundedMenu("", self)
-        regenerate_action = menu.addAction("Regenerate Name")
         action_label = "Resolve Issue..." if plan_status == "CONFLICT" or issue_type not in ("NONE", "MANUAL_EDIT") else "Change Action..."
         change_action = menu.addAction(action_label)
         change_action.setEnabled(plan_status in ("CONFLICT", "OVERWRITE", "SUFFIX", "TAG", "SKIP") or issue_type not in ("NONE", "MANUAL_EDIT"))
@@ -4347,9 +4455,7 @@ class MainWindow(QWidget):
         remove_action = menu.addAction("Remove from Table")
 
         chosen = menu.exec(global_pos)
-        if chosen == regenerate_action:
-            self.regenerate_rows(rows)
-        elif chosen == change_action:
+        if chosen == change_action:
             self.change_action_for_rows(rows)
         elif chosen == open_source_action:
             for selected_row in rows:
@@ -4362,19 +4468,6 @@ class MainWindow(QWidget):
                 reveal_in_explorer(dest_path or self.target_folder or "")
         elif chosen == remove_action:
             self.remove_rows_from_plan(rows)
-
-    def regenerate_rows(self, rows: list[int]):
-        for row in rows:
-            source_path = self._row_source_path(row)
-            if not source_path:
-                continue
-            meta = self.drop_area.row_plan_by_source.setdefault(source_path, {})
-            meta["manual_edited"] = False
-            meta["issue_type"] = "NONE"
-            meta["plan_status"] = "PENDING"
-            self.preview_conflict_decisions.pop(source_path, None)
-            self._set_plan_status(row, "PENDING", "NONE")
-        self.run_renamer(preview_mode=True)
 
     def change_action_for_rows(self, rows: list[int]):
         if not rows:
@@ -4414,6 +4507,10 @@ class MainWindow(QWidget):
         action, alt_path, _apply_all = action_result
         if action == "CONFLICT":
             self._set_plan_status(row, "CONFLICT", issue_type)
+            source_path = self._row_source_path(row)
+            if source_path:
+                self.subtitle_status[source_path] = "pending"
+                self.update_subtitle_status_display()
             return
         self._apply_conflict_action([row], action, alt_path, row)
 
@@ -4423,8 +4520,9 @@ class MainWindow(QWidget):
         if not source_path or not name_item:
             return None
         name = name_item.text().strip()
-        dest_path = self._planned_destination_path(row, name) or ""
         meta = self.drop_area.row_plan_by_source.get(source_path, {})
+        name = (meta.get("clean_generated_name") or meta.get("last_generated_name") or name).strip()
+        dest_path = self._planned_destination_path(row, name) or ""
         return self.ask_conflict(
             source_path,
             meta.get("conflict_path") or dest_path,
@@ -4442,6 +4540,13 @@ class MainWindow(QWidget):
         tag = None
         if action == "TAG" and alt_path:
             template_name = (self.drop_area.table.item(template_row, SubCol.RENAME_TO) or QTableWidgetItem("")).text().strip()
+            template_source = self._row_source_path(template_row)
+            template_meta = self.drop_area.row_plan_by_source.get(template_source or "", {})
+            template_name = (
+                template_meta.get("clean_generated_name")
+                or template_meta.get("last_generated_name")
+                or template_name
+            ).strip()
             template_base = os.path.splitext(template_name)[0]
             alt_base = os.path.splitext(os.path.basename(alt_path))[0]
             if alt_base.startswith(template_base + "."):
@@ -4453,6 +4558,12 @@ class MainWindow(QWidget):
             if not source_path or not name_item:
                 continue
             current_name = name_item.text().strip()
+            meta = self.drop_area.row_plan_by_source.setdefault(source_path, {})
+            current_name = (
+                meta.get("clean_generated_name")
+                or meta.get("last_generated_name")
+                or current_name
+            ).strip()
             base, ext = os.path.splitext(current_name)
             status = action
 
@@ -4478,9 +4589,9 @@ class MainWindow(QWidget):
             else:
                 status = "CONFLICT"
 
-            meta = self.drop_area.row_plan_by_source.setdefault(source_path, {})
-            meta["manual_edited"] = True
+            meta["user_modified"] = True
             meta["issue_type"] = "MANUAL_EDIT" if status not in ("CONFLICT", "SKIP") else meta.get("issue_type", "ON_DISK_COLLISION")
+            self.subtitle_status[source_path] = "pending"
             self._set_plan_status(row, status, meta.get("issue_type"))
             final_name_item = self.drop_area.table.item(row, SubCol.RENAME_TO)
             final_name = final_name_item.text().strip() if final_name_item else ""
@@ -4490,6 +4601,7 @@ class MainWindow(QWidget):
                 self.preview_conflict_decisions[source_path] = {"status": status, "new_name": final_name}
             else:
                 self.preview_conflict_decisions.pop(source_path, None)
+        self.update_subtitle_status_display()
 
     def remove_rows_from_plan(self, rows: list[int]):
         for row in sorted(rows, reverse=True):
